@@ -75,7 +75,7 @@ def test_real_incident_lifecycle():
         service
     )
 
-    assert baseline.status.value == "healthy"
+   assert baseline.status.value == "HEALTHY"
 
     # Establish healthy state.
     run_monitoring_cycle(
@@ -131,7 +131,7 @@ def test_real_incident_lifecycle():
         service
     )
 
-    assert recovered.status.value == "healthy"
+    assert recovered.status.value == "HEALTHY"
 
     # Recovery observation #1
     run_monitoring_cycle(
