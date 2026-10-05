@@ -60,7 +60,7 @@ def test_simulator_url_fallback(
     )
 
     assert (
-        service.health_url
+        str(service.health_url)
         == "https://example.com/health"
     )
 
@@ -104,7 +104,7 @@ def test_single_service_json_configuration(
     assert service.name == "Customer API"
 
     assert (
-        service.health_url
+        str(service.health_url)
         == "https://api.example.com/health"
     )
 
