@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 import time
 
 # Import database models so SQLAlchemy registers
@@ -27,7 +28,7 @@ from notifications.incident import (
 
 
 # =================================================
-# LOGGING CONFIGURATION
+# LOGGING
 # =================================================
 
 logging.basicConfig(
@@ -43,7 +44,7 @@ logger = logging.getLogger(
 
 
 # =================================================
-# MONITORING CONFIGURATION
+# CONFIGURATION
 # =================================================
 
 CHECK_INTERVAL_SECONDS = int(
@@ -55,6 +56,53 @@ CHECK_INTERVAL_SECONDS = int(
 
 
 # =================================================
+# WORKER LIFECYCLE
+# =================================================
+
+shutdown_requested = False
+
+
+def request_shutdown(
+    signum,
+    frame,
+):
+    """
+    Request a graceful worker shutdown.
+
+    Deployment platforms commonly send
+    SIGTERM before stopping a process.
+    """
+
+    del frame
+
+    global shutdown_requested
+
+    shutdown_requested = True
+
+    logger.info(
+        "Shutdown requested. signal=%s",
+        signum,
+    )
+
+
+def install_signal_handlers():
+    """
+    Install operating-system signal handlers
+    used by the continuous worker.
+    """
+
+    signal.signal(
+        signal.SIGTERM,
+        request_shutdown,
+    )
+
+    signal.signal(
+        signal.SIGINT,
+        request_shutdown,
+    )
+
+
+# =================================================
 # SINGLE MONITORING CYCLE
 # =================================================
 
@@ -62,16 +110,8 @@ def run_monitoring_cycle(
     services,
 ):
     """
-    Run one complete monitoring cycle.
-
-    For every configured service:
-
-    1. Load previous state from database.
-    2. Perform HTTP health check.
-    3. Process result through state engine.
-    4. Persist updated state.
-    5. Persist incident/event when required.
-    6. Send notification for meaningful events.
+    Run one complete monitoring cycle across
+    all configured services.
     """
 
     session = SessionLocal()
@@ -90,7 +130,7 @@ def run_monitoring_cycle(
             )
 
             # -------------------------------------
-            # PERFORM HTTP HEALTH CHECK
+            # HEALTH CHECK
             # -------------------------------------
 
             result = check_service(
@@ -98,7 +138,7 @@ def run_monitoring_cycle(
             )
 
             # -------------------------------------
-            # PROCESS STATE TRANSITION
+            # STATE ENGINE
             # -------------------------------------
 
             event = process_health_result(
@@ -107,17 +147,13 @@ def run_monitoring_cycle(
             )
 
             # -------------------------------------
-            # PERSIST CURRENT STATE
+            # PERSIST STATE
             # -------------------------------------
 
             save_service_state(
                 session,
                 state,
             )
-
-            # -------------------------------------
-            # LOG CURRENT OBSERVATION
-            # -------------------------------------
 
             logger.info(
                 "service=%s "
@@ -137,13 +173,11 @@ def run_monitoring_cycle(
             )
 
             # -------------------------------------
-            # HANDLE MEANINGFUL STATE CHANGE
+            # INCIDENT EVENT
             # -------------------------------------
 
             if event:
 
-                # Persist monitoring event and
-                # open/resolve corresponding incident.
                 incident = handle_monitoring_event(
                     session,
                     event,
@@ -174,15 +208,8 @@ def run_monitoring_cycle(
                     )
 
                 # ---------------------------------
-                # SEND INCIDENT NOTIFICATION
+                # NOTIFICATION
                 # ---------------------------------
-                #
-                # Notification happens ONLY when the
-                # state engine generates an event.
-                #
-                # This prevents NovaOps from sending
-                # an email every monitoring cycle
-                # while a service remains down.
 
                 notification_sent = (
                     notify_incident_event(
@@ -216,45 +243,60 @@ def run_monitoring_cycle(
 
 
 # =================================================
-# PERSISTENT MONITORING WORKER
+# CONTINUOUS WORKER
 # =================================================
 
 def run_worker():
     """
-    Start the persistent NovaOps monitoring worker.
+    Start NovaOps continuous monitoring.
 
-    The worker continuously:
+    Startup sequence:
 
-    - checks configured services
-    - evaluates service health
-    - tracks consecutive failures
-    - tracks consecutive recoveries
-    - persists monitoring state
-    - creates/resolves incidents
-    - sends incident notifications
+    1. Initialize database.
+    2. Validate/load service configuration.
+    3. Install shutdown handlers.
+    4. Continuously monitor services.
+    5. Exit cleanly when termination is requested.
     """
 
-    # Ensure database tables exist.
+    global shutdown_requested
+
+    shutdown_requested = False
+
+    logger.info(
+        "Starting NovaOps monitoring worker."
+    )
+
+    # ---------------------------------------------
+    # DATABASE INITIALIZATION
+    # ---------------------------------------------
+
     create_database()
 
-    # Load monitored services.
+    # ---------------------------------------------
+    # SERVICE CONFIGURATION
+    # ---------------------------------------------
+
     services = get_monitored_services()
 
     if not services:
 
         logger.error(
             "No monitored services configured. "
-            "Set NOVAOPS_SIMULATOR_URL."
+            "Worker cannot start."
         )
 
         return
 
-    logger.info(
-        "NovaOps persistent monitoring worker started."
-    )
+    # ---------------------------------------------
+    # SIGNAL HANDLERS
+    # ---------------------------------------------
+
+    install_signal_handlers()
 
     logger.info(
-        "Monitoring %s service(s) every %s seconds.",
+        "NovaOps worker started. "
+        "services=%s interval_seconds=%s",
         len(services),
         CHECK_INTERVAL_SECONDS,
     )
@@ -263,7 +305,9 @@ def run_worker():
     # CONTINUOUS MONITORING LOOP
     # ---------------------------------------------
 
-    while True:
+    while not shutdown_requested:
+
+        cycle_started = time.monotonic()
 
         try:
 
@@ -273,20 +317,60 @@ def run_worker():
 
         except Exception:
 
-            # One monitoring-cycle failure should
-            # not permanently terminate NovaOps.
+            # One failed cycle must not permanently
+            # terminate the monitoring process.
             logger.exception(
                 "Worker cycle failed. "
                 "Monitoring will continue."
             )
 
-        time.sleep(
-            CHECK_INTERVAL_SECONDS
+        cycle_duration = (
+            time.monotonic()
+            - cycle_started
         )
+
+        sleep_seconds = max(
+            0,
+            CHECK_INTERVAL_SECONDS
+            - cycle_duration,
+        )
+
+        logger.info(
+            "Monitoring cycle completed. "
+            "duration_seconds=%.2f "
+            "next_check_seconds=%.2f",
+            cycle_duration,
+            sleep_seconds,
+        )
+
+        # Sleep in short increments so SIGTERM/SIGINT
+        # can stop the worker promptly instead of
+        # waiting for the entire monitoring interval.
+        sleep_remaining = sleep_seconds
+
+        while (
+            sleep_remaining > 0
+            and not shutdown_requested
+        ):
+
+            sleep_chunk = min(
+                1.0,
+                sleep_remaining,
+            )
+
+            time.sleep(
+                sleep_chunk
+            )
+
+            sleep_remaining -= sleep_chunk
+
+    logger.info(
+        "NovaOps monitoring worker stopped cleanly."
+    )
 
 
 # =================================================
-# APPLICATION ENTRY POINT
+# ENTRY POINT
 # =================================================
 
 if __name__ == "__main__":
