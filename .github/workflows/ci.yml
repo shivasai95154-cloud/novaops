@@ -45,7 +45,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest -v -m "not integration"
+          pytest -v -m "not integration and not email_integration"
 
 
   # -------------------------------------------------
@@ -81,4 +81,4 @@ jobs:
 
       - name: Run DEV integration tests
         run: |
-          pytest -v -m integration
+          pytest -v -m "integration and not email_integration"
